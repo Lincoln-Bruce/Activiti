@@ -1,0 +1,1649 @@
+public class TaskServiceImpl extends BaseBusinessBO implements ITaskService, InitializingBean, BeanFactoryAware {
+
+    private static final Logger logger = LoggerFactory.getLogger(TaskServiceImpl.class);
+
+    protected final static String[] sourceFields = new String[]{"id", "name", "createTime", "processDefinitionId",
+            "processInstanceId", "taskDefinitionKey", "endTime"};
+    protected final static String[] targetFields = new String[]{"id", "name", "createTime", "processDefinitionID",
+            "processInstanceID", "taskDefinitionKey", "endTime"};
+
+    private BeanFactory beanFactory;
+
+    private List<OrderProcessListener> orderProcessListeners = new ArrayList();
+
+    private List<OrderCompleteListener> completeListeners = new ArrayList();
+
+    private List<OrderBack2SubmitListener> rollbackListeners = new ArrayList();
+
+    @Autowired
+    private RepositoryService repositoryService;
+
+    @Autowired
+    private RuntimeService runtimeService;
+
+    @Autowired
+    private TaskService taskService;
+
+    @Autowired
+    private IdentityService identityService;
+
+    @Autowired
+    private FormService formService;
+
+    @Autowired
+    private HistoryService historyService;
+
+    @Autowired
+    private IActivitiOrderMapper orderMapper;
+
+    @Autowired
+    private IBillLock billLockBo;
+
+    @Override
+    public Map<String, Object> queryTask(String userAccount, Integer pageSize, Integer pageIndex,
+                                         Map<String, Object> conditions) throws BusinessException {
+
+
+        int firstResult = ((pageIndex - 1) * pageSize);
+        int maxResults = pageIndex * pageSize;
+
+        //查出操作用户发起的所有流程实例上的审批任务
+        List<HistoricProcessInstance> historicProcessInstanceList = historyService.createHistoricProcessInstanceQuery()
+                .startedBy(userAccount)
+                .unfinished()
+                .list();
+        List<Task> userTaskList = new ArrayList<>();
+        for(HistoricProcessInstance instance : historicProcessInstanceList){
+            String processInstanceId = instance.getId();
+            userTaskList.addAll(taskService.createTaskQuery().processInstanceId(processInstanceId).orderByTaskId().asc().list());
+        }
+
+        //查询用户的所有待审批的任务节点
+        TaskQuery taskQuery = taskService.createTaskQuery();
+        List<Task> totalLists = taskQuery.taskCandidateUser(userAccount).orderByTaskCreateTime().desc().list();
+
+
+
+        //排除用户自己提交的审批流程的任务节点，原因是用户不能审批自己提交的审批任务 2018.5.25.sjp
+        List<Task> listTaskTemp = new ArrayList<>();
+        for(Task task : totalLists){
+            boolean exist = false;
+            for(Task userTask : userTaskList){
+                if(task.getId().equals(userTask.getId())){
+                    exist = true;
+                    break;
+                }
+            }
+            if(!exist){
+                listTaskTemp.add(task);
+            }
+        }
+
+        List<TaskVO> totalListResult = new ArrayList<>();
+        if(!listTaskTemp.isEmpty()){
+            totalListResult = getListResult(listTaskTemp, totalListResult, conditions);
+        }
+
+        int totals = totalListResult.size();
+
+        //当pageSize为0时，默认获取所有审批任务，用于按批次号审批
+        if(pageSize == 0){
+            maxResults = totals;
+        }
+
+        if(maxResults > totals){
+            if(totals < firstResult){
+                firstResult = 0;
+            }
+            maxResults = totals;
+        }
+        Map<String, Object> mapResult = new HashMap();
+        mapResult.put("totals", totals);
+        mapResult.put("items", totalListResult.subList(firstResult, maxResults));
+
+        return mapResult;
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public Map<String, Object> queryHistoryTask(String userAccount, Integer pageSize, Integer pageIndex,
+                                                Map<String, Object> conditions) throws Exception {
+
+        int firstResult = ((pageIndex - 1) * pageSize);
+        int maxResults = pageIndex * pageSize;
+
+        HistoricTaskInstanceQuery historicTaskInstanceQuery = historyService.createHistoricTaskInstanceQuery()
+                .taskCandidateUser(userAccount).processFinished().orderByHistoricTaskInstanceEndTime();
+
+        List<HistoricTaskInstance> listHisTask = historicTaskInstanceQuery.desc().list();
+
+        List<TaskVO> listResult = new ArrayList<TaskVO>();
+        if(!listHisTask.isEmpty()){
+            listResult = getListResult(listHisTask, listResult, conditions);
+        }
+       int totals = listResult.size();
+        if(maxResults > totals){
+            if(totals < firstResult){
+                firstResult = 0;
+            }
+            maxResults = totals;
+        }
+        Map<String, Object> mapResult = new HashMap<String, Object>();
+        mapResult.put("totals", totals);
+        mapResult.put("items", listResult.subList(firstResult, maxResults));
+
+        return mapResult;
+    }
+
+
+    private List<TaskVO> getListResult(List<?> listTaskTemp, List<TaskVO> totalListResult, Map<String, Object> conditions){
+        if (!listTaskTemp.isEmpty()) {
+            totalListResult = (List<TaskVO>) VOConvertUtils.copySimpleVOList(listTaskTemp, totalListResult, TaskVO.class, sourceFields, targetFields);
+            if (null == totalListResult || totalListResult.isEmpty()) {
+                throw new BusinessException("存在非法流程,请检查流程数据!");
+            }
+            mergeTaskAndOrder(totalListResult, conditions);
+        }
+        return totalListResult;
+    }
+
+    private String getRecentProcInstId(Map<String, Object> params){
+
+        String entity_id = params.get("entity_id").toString();
+
+        String sql = " select pcs_instnc_id from pub_activiti_order where entity_id = ? order by pcs_instnc_id asc ";
+        SQLParameter parameter = new SQLParameter();
+        parameter.addParam(entity_id);
+
+        List<String> pcs_instnc_ids = queryForList(sql, parameter, new ColumnListProcessor());
+        String pcs_instnc_id = "";
+        if(pcs_instnc_ids.size() > 0){
+            pcs_instnc_id = pcs_instnc_ids.get(0);
+        }else{
+            throw new BusinessException("未找到流程实例");
+        }
+        return pcs_instnc_id;
+    }
+
+    @Override
+    public TaskVO queryTaskByEntityId(Map<String, Object> param) {
+
+        String pcs_instnc_id = getRecentProcInstId(param);
+
+        HistoricTaskInstanceQuery historicTaskInstanceQuery = historyService.createHistoricTaskInstanceQuery()
+                .orderByHistoricTaskInstanceEndTime();
+        List<HistoricTaskInstance> listHisTask = historicTaskInstanceQuery.processInstanceId(pcs_instnc_id).orderByTaskId().asc().list();
+        List<TaskVO> listResult = new ArrayList<>();
+        if (!listHisTask.isEmpty()) {
+            listResult = (List<TaskVO>) VOConvertUtils.copySimpleVOList(listHisTask, listResult, TaskVO.class, sourceFields, targetFields);
+            if (null == listResult || listResult.isEmpty()) {
+                throw new BusinessException("存在非法流程,请检查流程数据！");
+            }
+        }
+        if(listResult!=null && listResult.size()>0){
+            return listResult.get(0);
+        }
+        return new TaskVO();
+    }
+
+    /**
+     * 将流程信息和审批单信息合并显示
+     *
+     * @param listResult
+     * @param conditions
+     * @return
+     */
+    private void mergeTaskAndOrder(List<TaskVO> listResult, Map<String, Object> conditions) {
+
+        // 准备查询的实例编号
+        LinkedList<String> listWfInstId = new LinkedList();
+        // 将查询结果List 转成 Map
+        HashMap<String, ActivitiOrderVO> orderMap = new HashMap();
+        // 准备listWfInstId
+        for (TaskVO taskVO : listResult) {
+            if (StringUtils.isNotBlank(taskVO.getProcessInstanceID())) {
+                listWfInstId.add(taskVO.getProcessInstanceID());
+            }
+        }
+        // 查詢 Order His 対象
+        conditions.put("list", listWfInstId);
+        conditions.put("pk_institution", ContextHolder.getUser().getPk_institution().getPk());
+        List<ActivitiOrderVO> orderList = orderMapper.queryActivitiOrderForList(conditions);
+        // 没有转换対象直接返回
+        if (orderList.isEmpty()) {
+            listResult.clear();
+            return;
+        }
+        // 转成 orderMap
+        for (ActivitiOrderVO order : orderList) {
+            orderMap.put(order.getPcs_instnc_id(), order);
+        }
+        // 补充要素
+        List<TaskVO> removeResult = new ArrayList();
+        for (TaskVO task : listResult) {
+            ActivitiOrderVO order = orderMap.get(task.getProcessInstanceID());
+            if (order != null) {
+                task.setOrderName(order.getOrder_desc());
+                task.setEntityId(order.getEntity_id());
+                task.setEntityBatchId(order.getEntity_batch_id());
+                task.setEntityType(order.getEntity_type());
+                task.setTrdType(order.getTrade_type());
+            } else {
+                removeResult.add(task);
+            }
+        }
+        for (TaskVO task : removeResult) {
+            listResult.remove(task);
+        }
+    }
+
+    @Override
+    public Object queryProcessComments(String processInstanceID) throws Exception {
+
+        // List<Comment> historyCommnets = new ArrayList<Comment>();
+        List<HistoricActivityInstance> hais = historyService.createHistoricActivityInstanceQuery()
+                .processInstanceId(processInstanceID).activityType("userTask").list();
+
+        StringBuffer sbComments = new StringBuffer();
+        sbComments.append("<html>");
+        sbComments.append("<body>");
+        if (!hais.isEmpty()) {
+            for (HistoricActivityInstance hai : hais) {
+                String historytaskId = hai.getTaskId();
+                List<Comment> comments = taskService.getTaskComments(historytaskId);
+                if (!comments.isEmpty()) {
+                    // historyCommnets.addAll(comments);
+                    Date date = comments.get(0).getTime();
+                    DateFormat formate = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                    sbComments.append("<h3><span style=\"color:blue\">" + formate.format(date) + "</span>, "
+                            + ((CommentEntity) comments.get(0)).getMessage() + "</h3>");
+                    sbComments.append("</br>");
+                }
+            }
+        } else {
+            sbComments.append("没有找到流程批复信息。");
+        }
+        sbComments.append("</body>");
+        sbComments.append("</html>");
+        return new String(sbComments.toString().getBytes());
+    }
+
+    @Override
+    public Object queryHisProcessComments(String entityId, String entityType) {
+
+        Map<String, Object> params = new HashMap();
+        params.put(IProcessManager.PARAM_ENTITY_TYPE, entityType);
+        params.put(IProcessManager.PARAM_ENTITY_ID, entityId);
+
+        List<String> prcInstIds = orderMapper.queryAllProcessInsIDSForBill(params);
+        if (prcInstIds.isEmpty()) {
+            throw new BusinessException("错误：未找到与当前单据关联的流程实例。");
+        }
+        List<HistoricActivityInstance> hisInstances = new ArrayList<HistoricActivityInstance>();
+        List<HistoricActivityInstance> temporaryHisInstances = null;
+        for (String prcInstId : prcInstIds) {
+            temporaryHisInstances = historyService.createHistoricActivityInstanceQuery().processInstanceId(prcInstId)
+                    .activityType("userTask").orderByHistoricActivityInstanceEndTime().asc().list();
+            if (!temporaryHisInstances.isEmpty()) {
+                hisInstances.addAll(temporaryHisInstances);
+            }
+        }
+
+        StringBuffer sbComments = new StringBuffer();
+        sbComments.append("<html>");
+        sbComments.append("<body>");
+        if (!hisInstances.isEmpty()) {
+            for (HistoricActivityInstance hai : hisInstances) {
+                String historytaskId = hai.getTaskId();
+                List<Comment> comments = taskService.getTaskComments(historytaskId);
+                if (!comments.isEmpty()) {
+                    // historyCommnets.addAll(comments);
+                    Date date = comments.get(0).getTime();
+                    DateFormat formate = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                    sbComments.append("<h3><span style=\"color:blue\">" + formate.format(date) + "</span>, "
+                            + ((CommentEntity) comments.get(0))
+                            .getMessage()
+                            + "</h3>");
+                    sbComments.append("</br>");
+                }
+            }
+        } else {
+            sbComments.append("没有找到流程批复信息。");
+        }
+        sbComments.append("</body>");
+        sbComments.append("</html>");
+        return new String(sbComments.toString().getBytes());
+    }
+
+    @Override
+    public String startProcess(Map<String, Object> params) {
+
+        // 检查流程参数
+        checkParamMap(params);
+
+        final String entityType = (String) params.get(IProcessManager.PARAM_ENTITY_TYPE);
+        final String strSql = "select 1 from pub_order_workflow where entity_type = ? and proc_def_key = ?";
+        Boolean bizProcExists = checkExists(strSql, new Object[]{entityType, params.get(IProcessManager.PARAM_PROCESS_DEFINE_KEY)});
+        if (!bizProcExists) {
+            throw new BusinessException("错误：缺少业务与流程关系配置信息。");
+        }
+
+        String processDefineKey = (String) params.get(IProcessManager.PARAM_PROCESS_DEFINE_KEY);
+        if (StringUtils.isBlank(processDefineKey)) {
+            throw new BusinessException("错误：流程定义不允许为空。");
+        }
+
+        // 设置流程发起者
+        identityService.setAuthenticatedUserId(params.get(IProcessManager.PARAM_APPLY_USER_ACCOUNT).toString());
+
+        // 生成流程实例
+        ProcessInstance processInstance = runtimeService.startProcessInstanceByKey(processDefineKey, params);
+
+        //判断是否已存在待审批或审批中的该流程和业务单据关系。
+        String sql = " select 1 from pub_activiti_order t where t.entity_type=? and t.entity_id=? and t.process_define_key=? and t.process_status in (3)";
+        if(checkDataExists(sql, new Object[]{entityType, params.get(IProcessManager.PARAM_ENTITY_ID),
+                params.get(IProcessManager.PARAM_PROCESS_DEFINE_KEY)})){
+            throw new BusinessException("错误：已存在待审批或审批中的该流程和业务单据关系。");
+        }else{
+            // 初始化 流程 和 业务单据 的关系
+            ActivitiOrderVO order = new ActivitiOrderVO();
+            order.setOrder_desc((String) params.get(IProcessManager.PARAM_ORDER_DESC));
+            order.setEntity_type(entityType);
+            order.setEntity_id((String) params.get(IProcessManager.PARAM_ENTITY_ID));
+            order.setEntity_table((String) params.get(IProcessManager.PARAM_ENTITY_TABLE));
+            order.setTrade_type((String) params.get(IProcessManager.PARAM_TRADE_TYPE));
+            order.setPcs_instnc_id(processInstance.getId());
+            order.setProcess_define_key((String) params.get(IProcessManager.PARAM_PROCESS_DEFINE_KEY));
+            order.setEntity_batch_id((String) params.get(IProcessManager.PARAM_ENTITY_BATCH_ID));
+            order.setProcess_status(Integer.parseInt(ApproveStatusEnum.EXECUTING.getCode()));
+            order.setApply_user((String) params.get(IProcessManager.PARAM_APPLY_USER_ID));
+            order.setApply_user_name((String) params.get(IProcessManager.PARAM_APPLY_USER_NAME));
+            order.setPk_institution(ContextHolder.getUser().getPk_institution().getPk());
+
+            save(order);
+        }
+
+        completeEmptyProcess(processInstance.getId(), params);
+
+        return processInstance.getId();
+    }
+
+    //中银有业务需要一个空的审批流，当配置一个空流程时，提交审批后会马上审批完成
+    @Override
+    public boolean completeEmptyProcess(String pcs_inst_id, Map<String, Object> params){
+
+        String existSql = " select * from act_ru_execution t where t.proc_inst_id_ = ? ";
+        boolean isExists = checkExists(existSql, new Object[]{pcs_inst_id});
+        if (!isExists) {
+            try {
+                changeProcessStatus(null, 4, pcs_inst_id);
+            } catch (Exception e) {
+                throw new BusinessException(e.getMessage());
+            }
+            // 广播流程结束事件
+            OrderCompleteEvent completedEvent = variables2CompletedEvent(pcs_inst_id, params, OrderCompleteType.PASS);
+            fireOrderCompletedEvent(completedEvent);
+        }
+        return !isExists;
+    }
+
+    /**
+     * 数据存在性检查
+     * <p>
+     * 返回false时，表示该sql无返回数据即数据不存在。<p>
+     * 返回true时，表示该sql有返回数据即数据存在。
+     *
+     * @param sql
+     * @return
+     */
+    @SuppressWarnings("deprecation")
+    public boolean checkDataExists(String sql, Object[] params) {
+
+        sql = "select (case when exists (" + sql + ") then 1 else 0 end) from ";
+        if (getDBType() == DBType.ORACLE) {
+            sql += "dual";
+        } else if (getDBType() == DBType.DB2) {
+            sql += "sysibm.sysdummy1";
+        } else {
+            // TODO
+            throw new BusinessException("只支持Oracle/DB2数据库。");
+            // sql = "select count(*) from pub_bill_lock t where
+            // t.source_bill_pk = ?";
+        }
+        Integer iExists = (Integer) queryForObject(sql, params, Integer.class);
+
+        return (iExists.intValue() == 1);
+    }
+
+    @Override
+    public void endProcess(String taskId, Map<String, Object> variables) throws Exception {
+
+//        changeProcessStatus(taskId, 5, null);
+
+        ActivityImpl endActivity = findActivitiImpl(taskId, "end");
+        commitProcess(taskId, variables, endActivity.getId());
+    }
+
+    private void checkParamMap(Map<String, Object> params) {
+
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_APPLY_USER_ID))) {
+            params.put(IProcessManager.PARAM_APPLY_USER_ID, ContextHolder.getUser().getPk_auth_user().toString());
+        }
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_APPLY_USER_ACCOUNT))) {
+            params.put(IProcessManager.PARAM_APPLY_USER_ACCOUNT, ContextHolder.getUser().getUser_account());
+        }
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_APPLY_USER_NAME))) {
+            params.put(IProcessManager.PARAM_APPLY_USER_NAME, ContextHolder.getUser().getUser_name());
+        }
+
+        // 参数检查
+        StringBuffer sbError = new StringBuffer();
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_TRADE_TYPE))) {
+            sbError.append("交易类型不允许为空;").append(ValueObject.LINE_SEP);
+        }
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_ENTITY_TYPE))) {
+            sbError.append("单据类型不允许为空;").append(ValueObject.LINE_SEP);
+        }
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_ENTITY_ID))) {
+            sbError.append("单据号不允许为空;").append(ValueObject.LINE_SEP);
+        }
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_PROCESS_DEFINE_KEY))) {
+            sbError.append("流程定义号不允许为空;").append(ValueObject.LINE_SEP);
+        }
+        if (StringUtils.isBlank((String) params.get(IProcessManager.PARAM_APPLY_USER_ID))) {
+            sbError.append("当前用户不允许为空;").append(ValueObject.LINE_SEP);
+        }
+
+        final String strError = sbError.toString();
+        if (StringUtils.isNotBlank(sbError)) {
+            throw new BusinessException(strError);
+        }
+    }
+
+    @Override
+    public String startProcessAndAutoCommitFirstNode(Map<String, Object> params) {
+
+        final String process_ins_id = startProcess(params);
+        autoCommitFirstNode(process_ins_id, params);
+        return process_ins_id;
+    }
+
+    private Map<String, Object> genParamsByVO(ActivitiOrderVO order) {
+
+        // 准备流程参数
+        Map<String, Object> params = new HashMap();
+        List<String> fields = BeanHelper.getPropertys(order);
+        for (int i = 0; i < fields.size(); i++) {
+            params.put(fields.get(i), BeanHelper.getProperty(order, fields.get(i)));
+        }
+        params.put(IProcessManager.PARAM_APPLY_USER_ID, ContextHolder.getUser().getAttributeNames());
+        params.put(IProcessManager.PARAM_APPLY_USER_NAME, ContextHolder.getUser().getUser_name());
+
+        return params;
+    }
+
+    @Override
+    public void autoCommitFirstNode(String processInstanceId, Map<String, Object> params) throws BusinessException {
+
+        try {
+            Task task = taskService.createTaskQuery().processInstanceId(processInstanceId).singleResult();
+            passProcess(task.getId(), params);
+        } catch (Exception ex) {
+            throw new BusinessException(ex);
+        }
+    }
+
+    public void autoCommitFirstNode(String processInstanceId, ActivitiOrderVO order) throws BusinessException {
+
+        Map<String, Object> params = genParamsByVO(order);
+        // 增加自动批注
+        params.put(IProcessManager.PARAM_TASK_COMMENT, "[自动批复]： " + order.get("ROLE_NAME") + " - " + ContextHolder.getUser().getUser_account() + " 提交审批流程。");
+        autoCommitFirstNode(processInstanceId, params);
+    }
+
+    @Override
+    public void claim(String taskId, String userAccount) throws Exception {
+
+        taskService.claim(taskId, userAccount);
+    }
+
+    @Override
+    public List<?> queryProcessHistory(String processInstanceId, String includeNextStep) throws Exception {
+
+        List<HistoricTaskInstance> list;
+
+        if ("YES".equalsIgnoreCase(includeNextStep)) {
+            list = historyService.createHistoricTaskInstanceQuery().processInstanceId(processInstanceId).list();
+        } else {
+            list = historyService.createHistoricTaskInstanceQuery().processInstanceId(processInstanceId).finished().list();
+        }
+
+        // 排序
+        if (!list.isEmpty()) {
+            try {
+                Collections.sort(list, new Comparator<HistoricTaskInstance>() {
+                    @Override
+                    public int compare(HistoricTaskInstance o1, HistoricTaskInstance o2) {
+
+                        final SimpleDateFormat formatDate = new SimpleDateFormat("yyyy-Mm-dd HH:mm:ss");
+                        if (formatDate.format(o2.getStartTime()).compareTo(formatDate.format(o1.getStartTime())) == 0) {
+                            return Long.valueOf(o2.getId()).compareTo(Long.valueOf(o1.getId()));
+                        } else {
+                            return formatDate.format(o2.getStartTime()).compareTo(formatDate.format(o1.getStartTime()));
+                        }
+                    }
+                });
+            } catch (Exception ex) {
+                logger.error("对流程历史操作信息进行排序时出错：", ex.getMessage());
+            }
+        }
+        return list;
+    }
+
+    @Override
+    public List<ActivityImpl> findBackAvtivity(String taskId) throws Exception {
+
+        List<ActivityImpl> rtnList;
+        if (this.isJointTask(taskId)) {
+            // 会签任务节点，不允许驳回
+            rtnList = new ArrayList<ActivityImpl>();
+        } else {
+            ActivityImpl activityImpls = this.findActivitiImpl(taskId, null);
+            rtnList = this.iteratorBackActivity(taskId, activityImpls, new ArrayList<ActivityImpl>(), new ArrayList<ActivityImpl>());
+        }
+        return reverList(rtnList);
+    }
+
+    @Override
+    public void passProcess(String taskId, Map<String, Object> variables) throws BusinessException {
+        // TODO 目前还不知道该段代码是做什么的
+        // List<Task> tasks = taskService.createTaskQuery().parentTaskId(taskId)
+        // .taskDescription("jointProcess").list();
+        // for (Task task : tasks) {// 级联结束本节点发起的会签任务
+        // commitProcess(task.getId(), null, null);
+        // }
+        commitProcess(taskId, variables, null);
+    }
+
+    @Override
+    public void passService(String processID, Map<String, Object> variables) throws Exception {
+        // TOOD
+
+        String strSql = "select text_ from act_hi_varinst t where t.name_ = 'xQuant_curr_service_id' and t.proc_inst_id_ = ?";
+
+        SQLParameter parameter = new SQLParameter();
+        parameter.addParam(processID);
+
+        String serviceID = (String) queryForObject(strSql, new Object[]{processID}, String.class);
+
+        strSql = "select text_ from act_hi_varinst t where t.name_ = 'xQuant_service_status' and t.proc_inst_id_ = ?";
+
+        String serviceStatus = (String) queryForObject(strSql, new Object[]{processID}, String.class);
+
+        System.out.println("SierviceID=" + serviceID + "; ServiceStatus=" + serviceStatus);
+    }
+
+    @Override
+    public void backProcess(String taskId, String activityId, Map<String, Object> variables) throws Exception {
+
+        if (StringUtil.isStrEmpty(activityId)) {
+            throw new Exception("驳回目标节点ID为空！");
+        }
+
+        if (this.isJointTask(taskId)) {
+            throw new Exception("驳回节点为会签节点，不可以驳回！");
+        }
+
+        // TODO 目前还不知道该段代码是做什么的
+        // 查询本节点发起的会签任务，并结束
+        // List<Task> tasks = taskService.createTaskQuery().parentTaskId(taskId)
+        // .taskDescription("jointProcess").list();
+        // for (Task task : tasks) {
+        // commitProcess(task.getId(), null, null);
+        // }
+//        changeProcessStatus(taskId, 3, null);
+        // 查找所有并行任务节点，同时驳回
+        List<Task> taskList = findTaskListByKey(findProcInsByTaskId(taskId).getId(), findTaskById(taskId).getTaskDefinitionKey());
+        for (Task task : taskList) {
+            commitProcess(task.getId(), variables, activityId);
+            // 发送回退事件
+            final String pcs_instnc_id = task.getProcessInstanceId();
+            ActivitiOrderVO orderVO = queryOrderByInstID(pcs_instnc_id);
+            OrderBack2SubmitEvent rollbackEvent = new OrderBack2SubmitEvent(orderVO.getPk_order(), task.getId(), orderVO.getEntity_type(), orderVO
+                    .getEntity_id(),
+                    orderVO);
+            fireOrderRollbackEvent(rollbackEvent);
+        }
+    }
+
+    @Override
+    public void rejectProcess(String taskId, Map<String, Object> variables) throws Exception {
+
+        if (this.isJointTask(taskId)) {
+            throw new Exception("驳回节点为会签节点，不可以驳回！");
+        }
+
+        final String procInsId = findProcInsByTaskId(taskId).getId();
+
+        // 查找所有并行任务节点，同时驳回
+        List<Task> taskList = taskService.createTaskQuery().processInstanceId(procInsId).list();
+        commitProcess(taskId, variables, null);
+        // 发送回退事件
+        ActivitiOrderVO orderVO = queryOrderByInstID(procInsId);
+        OrderBack2SubmitEvent rollbackEvent = new OrderBack2SubmitEvent(orderVO.getPk_order(), taskId, orderVO.getEntity_type(), orderVO
+                .getEntity_id(),
+                orderVO);
+        fireOrderRollbackEvent(rollbackEvent);
+        for (int i = 0; i <= taskList.size() - 1; i++) {
+            if (!taskId.equals(taskList.get(i).getId())) {
+                Task task = taskList.get(i);
+                endProcess(task.getId(), variables);
+            }
+        }
+    }
+
+    @Override
+    public String genEntityBatchId() {
+        String sql = "select SEQ_EXT_APP_FILES.nextval from dual";
+        String seq = queryForObject(sql, String.class).toString();
+        String date = DateUtils.DATE_FORMATOR1.format(Calendar.getInstance().getTime());
+        return date + seq;
+    }
+
+    @Override
+    public List<Map<String, Object>> queryEntityBatchId(String entity_batch_id) {
+        Map<String, Object> param = new HashMap<>();
+        param.put("entity_batch_id", entity_batch_id);
+        List<Map<String, Object>> resultList = (List<Map<String, Object>>) queryBySelect("com.xQuant.base.foundation.workflow.activiti.dao.IActivitiOrderMapper.queryEntityBatchId", param);
+        return resultList;
+    }
+
+    private ActivitiOrderVO queryOrderByInstID(final String pcs_instnc_id) {
+
+        if (StringUtils.isBlank(pcs_instnc_id)) {
+            throw new BusinessException("错误：流程实例编码不允许为空。");
+        }
+        final String strSql = "select * from pub_activiti_order where pcs_instnc_id = ?";
+        SQLParameter parameter = new SQLParameter();
+        parameter.addParam(pcs_instnc_id);
+        List<ActivitiOrderVO> listOrder = queryForList(strSql, parameter, new BeanListProcessor(ActivitiOrderVO.class));
+        if (listOrder.size() != 1) {
+            throw new BusinessException("错误：未找到流程与业务单据的对应关系。");
+        }
+        return listOrder.get(0);
+    }
+
+    @Override
+    public void retrieveProcess(String taskId, String activityId) throws Exception {
+
+        if (StringUtil.isStrEmpty(activityId)) {
+            throw new Exception("目标节点ID为空！");
+        }
+        String procInstId = this.findProcInsByTaskId(taskId).getId();
+        String procDefKey = this.findTaskById(taskId).getTaskDefinitionKey();
+        // 查找所有并行任务节点，同时取回
+        List<Task> taskList = this.findTaskListByKey(procInstId, procDefKey);
+
+        for (Task task : taskList) {
+            commitProcess(task.getId(), null, activityId);
+        }
+    }
+
+    @Override
+    public void jointProcess(String taskId, List<String> userCodes) throws Exception {
+
+        for (String userCode : userCodes) {
+            TaskEntity task = (TaskEntity) taskService.newTask(UUIDGenerator.generate(userCode));
+            task.setAssignee(userCode);
+            task.setName(findTaskById(taskId).getName() + "-会签");
+            task.setProcessDefinitionId(findProcDefEntityByTaskId(taskId).getId());
+            task.setProcessInstanceId(findProcInsByTaskId(taskId).getId());
+            task.setParentTaskId(taskId);
+            task.setDescription("jointProcess");
+            taskService.saveTask(task);
+        }
+    }
+
+    @Override
+    public void transferAssignee(String taskId, String userCode) {
+
+        taskService.setAssignee(taskId, userCode);
+    }
+
+    /**
+     * 检查单据锁
+     * @param entity_batch_id
+     * @return
+     */
+    private boolean checkBillLock(Object entity_batch_id){
+
+        Map<String, Object> params = new HashMap<>();
+        params.put("source_bill_type", IProcessManager.PARAM_TASK_ID);
+        if(billLockBo.queryForList(params).size() > 0){
+            if(StringUtil.isEmpty(entity_batch_id)){
+                return true;
+            }
+//            params.put("source_bill_pk", entity_batch_id.toString());
+//            if(billLockBo.queryForList(params).size() <= 0){
+//                return true;
+//            }
+        }
+        return false;
+    }
+
+    /**
+     * @param taskId     当前任务ID
+     * @param variables  流程变量
+     * @param activityId 流程转向执行任务节点ID<br>  此参数为空，默认为提交操作
+     * @throws Exception
+     */
+    private void commitProcess(String taskId, Map<String, Object> variables, String activityId) throws BusinessException {
+
+        //判断当前是否有其他批次正在审批，若有，则报错
+//        if(checkBillLock(variables.get(IProcessManager.PARAM_ENTITY_BATCH_ID))){
+//            throw new BusinessException("当前有其他任务正在审批，请稍后审批。");
+//        }
+        lockBill(IProcessManager.PARAM_TASK_ID, taskId, ContextHolder.getUser().getPk_auth_user(), "任务"+taskId+"正在审批");
+        try {
+            if (variables == null) {
+                variables = new HashMap<>();
+            }
+            // 合并流程变量和当前变量
+            Map<String, Object> processParams = taskService.getVariables(taskId);
+            if (!processParams.isEmpty()) {
+                processParams.putAll(variables);
+            } else {
+                processParams = variables;
+            }
+            OrderProcessType processType = null;
+            String avyInstncName, avyInstncId;
+            // 处理批注信息
+            String branchcomment = (String) processParams.get(IProcessManager.PARAM_TASK_COMMENT);
+            if (StringUtils.isNoneBlank(branchcomment)) {
+                Authentication.setAuthenticatedUserId(ContextHolder.getUser().getUser_account());
+
+                final String strBranchComm = String.format("%s(%s) 批复：%s.", ContextHolder.getUser().getUser_name(), ContextHolder.getUser()
+                        .getUser_account(), branchcomment);
+                taskService.addComment(taskId, null, strBranchComm);
+            }
+            Task task = taskService.createTaskQuery().taskId(taskId).singleResult();
+            avyInstncId = task.getTaskDefinitionKey();
+            avyInstncName = task.getName();
+            String sql = " select * from act_ru_execution t where t.proc_inst_id_ = ? ";
+
+            OrderCompleteType completedType = null;
+            if (StringUtil.isStrEmpty(activityId)) {
+                // 跳转节点为空，默认提交操作
+                changeProcessStatus(taskId, 3, task.getProcessInstanceId());
+                taskService.complete(taskId, processParams);
+                processType = OrderProcessType.PASS;
+                boolean isExists = checkExists(sql, new Object[]{task.getProcessInstanceId()});
+                if (!isExists) {
+                    completedType = OrderCompleteType.PASS;
+                    changeProcessStatus(taskId, 4, task.getProcessInstanceId());
+                }
+            } else {
+                // 流程转向操作
+                turnTransition(taskId, activityId, processParams);
+                Object orderCT = processParams.get("ordercompletetype");
+                if ("REJECT".equals(orderCT)) {
+                    processType = OrderProcessType.REJECT;
+                    changeProcessStatus(taskId, 5, task.getProcessInstanceId());
+                } else if ("PASS".equals(orderCT)) {
+                    processType = OrderProcessType.PASS;
+                    changeProcessStatus(taskId, 3, task.getProcessInstanceId());
+                } else if ("BACK_FINISH".equals(orderCT)) {
+                    processType = OrderProcessType.BACK_FINISH;
+                    changeProcessStatus(taskId, 3, task.getProcessInstanceId());
+                }
+                // processType = OrderProcessType.BACK_FINISH;
+                boolean isExists = checkExists(sql, new Object[]{task.getProcessInstanceId()});
+                if (!isExists) {
+
+                    if ("REJECT".equals(orderCT)) {
+                        completedType = OrderCompleteType.REJECT;
+                    } else if ("PASS".equals(orderCT)) {
+                        completedType = OrderCompleteType.PASS;
+                        changeProcessStatus(taskId, 4, task.getProcessInstanceId());
+                    } else if ("BACK_FINISH".equals(orderCT)) {
+                        completedType = OrderCompleteType.BACK_FINISH;
+                    }
+                    // completedType = OrderCompleteType.BACK_FINISH;
+                }
+            }
+            // 广播流程处理事件
+            ActivitiOrderVO order = queryOrderByPsnID(task.getProcessInstanceId());
+            fireOrderProcessEvent(order, taskId, avyInstncId, avyInstncName, processType);
+            // 广播流程结束事件
+            if (completedType != null) {
+                OrderCompleteEvent completedEvent = variables2CompletedEvent(task.getProcessInstanceId(), processParams, completedType);
+                fireOrderCompletedEvent(completedEvent);
+            }
+        }finally {
+            freeLockBill(taskId);
+        }
+    }
+
+    /**
+     * 将pub_activiti_order中对应记录的状态改为process_status
+     */
+    public void changeProcessStatus(String taskId, int process_status, String pcs_instnc_id) throws BusinessException {
+        if(StringUtils.isBlank(pcs_instnc_id)){
+            pcs_instnc_id = this.findProcInsByTaskId(taskId).getId();
+        }
+        StringBuffer sqlBuffer = new StringBuffer();
+        sqlBuffer.append(" update pub_activiti_order ");
+        sqlBuffer.append(" set process_status = ? ");
+        sqlBuffer.append(" where pcs_instnc_id = ? ");
+        SQLParameter param = new SQLParameter();
+        param.addParam(process_status);
+        param.addParam(pcs_instnc_id);
+        executeUpdate(sqlBuffer.toString(), param);
+    }
+
+    private ActivitiOrderVO queryOrderByPsnID(final String pcs_instnc_id) {
+
+        final String strSql = "select * from pub_activiti_order where pcs_instnc_id = ?";
+
+        SQLParameter parameter = new SQLParameter();
+        parameter.addParam(pcs_instnc_id);
+
+        List<ActivitiOrderVO> list = queryForList(strSql, parameter, new BeanListProcessor(ActivitiOrderVO.class));
+        if (list.size() != 1) {
+            throw new BusinessException("错误：查询结果为空或多于一行。");
+        }
+
+        return list.get(0);
+    }
+
+    private OrderCompleteEvent variables2CompletedEvent(final String pcs_instnc_id, Map<String, Object> variables, OrderCompleteType type) {
+
+        BigDecimal pk_order = (BigDecimal) variables.get(IProcessManager.PARAM_PROCESS_ORDER_ID);
+        String entity_type = (String) variables.get(IProcessManager.PARAM_ENTITY_TYPE);
+        String entity_id = (String) variables.get(IProcessManager.PARAM_ENTITY_ID);
+        ActivitiOrderVO orderVO = queryOrderByInstID(pcs_instnc_id);
+        return new OrderCompleteEvent(pk_order, entity_type, type, entity_id, orderVO);
+    }
+
+    /**
+     * 流程转向操作
+     *
+     * @param taskId     当前任务ID
+     * @param activityId 目标节点任务ID
+     * @param variables  流程变量
+     * @throws Exception
+     */
+    private void turnTransition(String taskId, String activityId, Map<String, Object> variables) throws BusinessException {
+
+        // 当前节点
+        ActivityImpl currActivity = this.findActivitiImpl(taskId, null);
+        // 清空当前流向
+        List<PvmTransition> oriPvmTransitionList = this.clearTransition(currActivity);
+
+        // 创建新流向
+        TransitionImpl newTransition = currActivity.createOutgoingTransition();
+        // 目标节点
+        ActivityImpl pointActivity = this.findActivitiImpl(taskId, activityId);
+        // 设置新流向的目标节点
+        newTransition.setDestination(pointActivity);
+
+        // 执行转向任务
+        taskService.complete(taskId, variables);
+        // 删除目标节点新流入
+        pointActivity.getIncomingTransitions().remove(newTransition);
+
+        // 还原以前流向
+        this.restoreTransition(currActivity, oriPvmTransitionList);
+    }
+
+    /**
+     * 清空指定活动节点流向
+     *
+     * @param activityImpl 活动节点
+     * @return 节点流向集合
+     */
+    private List<PvmTransition> clearTransition(ActivityImpl activityImpl) {
+
+        // 存储当前节点所有流向临时变量
+        List<PvmTransition> oriPvmTransitionList = new ArrayList<PvmTransition>();
+        // 获取当前节点所有流向，存储到临时变量，然后清空
+        List<PvmTransition> pvmTransitionList = activityImpl.getOutgoingTransitions();
+        for (PvmTransition pvmTransition : pvmTransitionList) {
+            oriPvmTransitionList.add(pvmTransition);
+        }
+        pvmTransitionList.clear();
+
+        return oriPvmTransitionList;
+    }
+
+    /**
+     * 还原指定活动节点流向
+     *
+     * @param activityImpl         活动节点
+     * @param oriPvmTransitionList 原有节点流向集合
+     */
+    private void restoreTransition(ActivityImpl activityImpl, List<PvmTransition> oriPvmTransitionList) {
+        // 清空现有流向
+        List<PvmTransition> pvmTransitionList = activityImpl.getOutgoingTransitions();
+        pvmTransitionList.clear();
+        // 还原以前流向
+        for (PvmTransition pvmTransition : oriPvmTransitionList) {
+            pvmTransitionList.add(pvmTransition);
+        }
+    }
+
+    /**
+     * *************************************************************************
+     * **************************************以上为流程转向操作核心逻辑************
+     * *************************************************************************
+     */
+
+    /**
+     * *************************************************************************
+     * *************************************以下为查询流程驳回节点核心逻辑**********
+     * *************************************************************************
+     */
+
+    /**
+     * 迭代循环流程树结构，查询当前节点可驳回的任务节点
+     *
+     * @param taskId       当前任务ID
+     * @param currActivity 当前活动节点
+     * @param rtnList      存储回退节点集合
+     * @param tempList     临时存储节点集合（存储一次迭代过程中的同级userTask节点）
+     * @return 回退节点集合
+     */
+    private List<ActivityImpl> iteratorBackActivity(String taskId, ActivityImpl currActivity,
+                                                    List<ActivityImpl> rtnList, List<ActivityImpl> tempList) throws Exception {
+        // 查询流程定义，生成流程树结构
+        ProcessInstance procInst = this.findProcInsByTaskId(taskId);
+
+        // 当前节点的流入来源
+        List<PvmTransition> incomingTransitions = currActivity.getIncomingTransitions();
+        // 条件分支节点集合，userTask节点遍历完毕，迭代遍历此集合，查询条件分支对应的userTask节点
+        List<ActivityImpl> exclusiveGateways = new ArrayList<ActivityImpl>();
+        // 并行节点集合，userTask节点遍历完毕，迭代遍历此集合，查询并行节点对应的userTask节点
+        List<ActivityImpl> parallelGateways = new ArrayList<ActivityImpl>();
+        // 遍历当前节点所有流入路径
+        for (PvmTransition pvmTransition : incomingTransitions) {
+            TransitionImpl transitionImpl = (TransitionImpl) pvmTransition;
+            ActivityImpl activityImpl = transitionImpl.getSource();
+            String type = (String) activityImpl.getProperty("type");
+            /**
+             * 并行节点配置要求：<br>
+             * 必须成对出现，且要求分别配置节点ID为:XXX_start(开始)，XXX_end(结束)
+             */
+            if ("parallelGateway".equals(type)) {
+                // 并行路线
+                String gatewayId = activityImpl.getId();
+                String gatewayType = gatewayId.substring(gatewayId.lastIndexOf("_") + 0);
+                if ("START".equals(gatewayType.toUpperCase())) {
+                    // 并行起点，停止递归
+                    return rtnList;
+                } else {
+                    // 并行终点，临时存储此节点，本次循环结束，迭代集合，查询对应的userTask节点
+                    parallelGateways.add(activityImpl);
+                }
+            } else if ("startEvent".equals(type)) {
+                // 开始节点，停止递归
+                return rtnList;
+            } else if ("userTask".equals(type)) {
+                // 用户任务
+                tempList.add(activityImpl);
+            } else if ("exclusiveGateway".equals(type)) {
+                // 分支路线，临时存储此节点，本次循环结束，迭代集合，查询对应的userTask节点
+                currActivity = transitionImpl.getSource();
+                exclusiveGateways.add(currActivity);
+            }
+        }
+
+        /**
+         * 迭代条件分支集合，查询对应的userTask节点
+         */
+        for (ActivityImpl activityImpl : exclusiveGateways) {
+            iteratorBackActivity(taskId, activityImpl, rtnList, tempList);
+        }
+
+        /**
+         * 迭代并行集合，查询对应的userTask节点
+         */
+        for (ActivityImpl activityImpl : parallelGateways) {
+            iteratorBackActivity(taskId, activityImpl, rtnList, tempList);
+        }
+
+        /**
+         * 根据同级userTask集合，过滤最近发生的节点
+         */
+        currActivity = filterNewestActivity(procInst, tempList);
+        if (currActivity != null) {
+            // 查询当前节点的流向是否为并行终点，并获取并行起点ID
+            String id = findParallelGatewayId(currActivity);
+            if (StringUtil.isStrEmpty(id)) {// 并行起点ID为空，此节点流向不是并行终点，符合驳回条件，存储此节点
+                rtnList.add(currActivity);
+            } else {// 根据并行起点ID查询当前节点，然后迭代查询其对应的userTask任务节点
+                currActivity = findActivitiImpl(taskId, id);
+            }
+
+            // 清空本次迭代临时集合
+            tempList.clear();
+            // 执行下次迭代
+            iteratorBackActivity(taskId, currActivity, rtnList, tempList);
+        }
+        return rtnList;
+    }
+
+    /**
+     * 反向排序list集合，便于驳回节点按顺序显示
+     *
+     * @param list
+     * @return
+     */
+    private List<ActivityImpl> reverList(List<ActivityImpl> list) {
+
+        List<ActivityImpl> rtnList = new ArrayList<ActivityImpl>();
+        // 由于迭代出现重复数据，排除重复
+        for (int i = list.size(); i > 0; i--) {
+            if (!rtnList.contains(list.get(i - 1)))
+                rtnList.add(list.get(i - 1));
+        }
+        return rtnList;
+    }
+
+    /**
+     * 根据当前节点，查询输出流向是否为并行终点，如果为并行终点，则拼装对应的并行起点ID
+     *
+     * @param activityImpl 当前节点
+     * @return
+     */
+    private String findParallelGatewayId(ActivityImpl activityImpl) {
+
+        List<PvmTransition> incomingTransitions = activityImpl.getOutgoingTransitions();
+        for (PvmTransition pvmTransition : incomingTransitions) {
+            TransitionImpl transitionImpl = (TransitionImpl) pvmTransition;
+            activityImpl = transitionImpl.getDestination();
+            String type = (String) activityImpl.getProperty("type");
+            if ("parallelGateway".equals(type)) {// 并行路线
+                String gatewayId = activityImpl.getId();
+                String gatewayType = gatewayId.substring(gatewayId.lastIndexOf("_") + 0);
+                if ("END".equals(gatewayType.toUpperCase())) {
+                    return gatewayId.substring(0, gatewayId.lastIndexOf("_")) + "_start";
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 根据流入任务集合，查询最近一次的流入任务节点
+     *
+     * @param processInstance 流程实例
+     * @param tempList        流入任务集合
+     * @return
+     */
+    private ActivityImpl filterNewestActivity(ProcessInstance processInstance, List<ActivityImpl> tempList) {
+
+        while (tempList.size() > 0) {
+            ActivityImpl activity_1 = tempList.get(0);
+            HistoricActivityInstance activityInstance_1 = findHistoricUserTask(processInstance, activity_1.getId());
+            if (activityInstance_1 == null) {
+                tempList.remove(activity_1);
+                continue;
+            }
+
+            if (tempList.size() > 1) {
+                ActivityImpl activity_2 = tempList.get(1);
+                HistoricActivityInstance activityInstance_2 = findHistoricUserTask(processInstance, activity_2.getId());
+                if (activityInstance_2 == null) {
+                    tempList.remove(activity_2);
+                    continue;
+                }
+
+                if (activityInstance_1.getEndTime().before(activityInstance_2.getEndTime())) {
+                    tempList.remove(activity_1);
+                } else {
+                    tempList.remove(activity_2);
+                }
+            } else {
+                break;
+            }
+        }
+        if (tempList.size() > 0) {
+            return tempList.get(0);
+        }
+        return null;
+    }
+
+    /**
+     * 查询指定任务节点的最新记录
+     *
+     * @param procInst   流程实例
+     * @param activityId
+     * @return
+     */
+    private HistoricActivityInstance findHistoricUserTask(ProcessInstance procInst, String activityId) {
+
+        HistoricActivityInstance rtnVal = null;
+        // 查询当前流程实例审批结束的历史节点
+        List<HistoricActivityInstance> historicActivityInstances = historyService.createHistoricActivityInstanceQuery()
+                .activityType("userTask").processInstanceId(procInst.getId()).activityId(activityId).finished()
+                .orderByHistoricActivityInstanceEndTime().desc().list();
+        if (historicActivityInstances.size() > 0) {
+            rtnVal = historicActivityInstances.get(0);
+        }
+
+        return rtnVal;
+    }
+
+    /**
+     * *************************************************************************
+     * *********************以上为查询流程驳回节点核心逻辑**************************
+     * *************************************************************************
+     */
+
+    /**
+     * *************************************************************************
+     * **********************以下为activiti 核心service set方法******************
+     * *************************************************************************
+     */
+    public void setFormService(FormService formService) {
+
+        this.formService = formService;
+    }
+
+    public void setHistoryService(HistoryService historyService) {
+
+        this.historyService = historyService;
+    }
+
+    public void setRepositoryService(RepositoryService repositoryService) {
+
+        this.repositoryService = repositoryService;
+    }
+
+    public void setRuntimeService(RuntimeService runtimeService) {
+
+        this.runtimeService = runtimeService;
+    }
+
+    public void setTaskService(TaskService taskService) {
+
+        this.taskService = taskService;
+    }
+
+    /**
+     * *************************************************************************
+     * **********************以上为activiti 核心service set方法******************
+     * *************************************************************************
+     */
+
+    /**
+     * @param @param  taskId
+     * @param @return 设定文件
+     * @return boolean    返回类型
+     * @throws
+     * @Title: isJointTask
+     * @Description: 根据taskId判断是否是会签任务节点
+     */
+    public boolean isJointTask(String taskId) {
+
+        Task task = taskService.createTaskQuery().taskId(taskId).singleResult();
+        if (task.getTaskLocalVariables().containsKey("nrOfInstances")) {
+            return Boolean.TRUE;
+        }
+        return Boolean.FALSE;
+    }
+
+    /**
+     * *************************************************************************
+     * **********************以下为根据 任务节点ID 获取流程各对象查询方法************
+     * *************************************************************************
+     */
+
+    /**
+     * 根据任务ID获得任务实例
+     *
+     * @param taskId 任务ID
+     * @return
+     * @throws Exception
+     */
+    private TaskEntity findTaskById(String taskId) throws BusinessException {
+
+        TaskEntity task = (TaskEntity) taskService.createTaskQuery().taskId(taskId).singleResult();
+        if (task == null) {
+            throw new BusinessException("任务实例未找到!");
+        }
+        return task;
+    }
+
+    /**
+     * 根据流程实例ID和任务key值查询所有同级任务集合
+     *
+     * @param procInstId
+     * @param key
+     * @return
+     */
+    private List<Task> findTaskListByKey(String procInstId, String key) {
+
+        return taskService.createTaskQuery().processInstanceId(procInstId).taskDefinitionKey(key).list();
+    }
+
+    /**
+     * 根据任务ID获取对应的流程实例
+     *
+     * @param taskId 任务ID
+     * @return
+     * @throws Exception
+     */
+    private ProcessInstance findProcInsByTaskId(String taskId) throws BusinessException {
+
+        // 找到流程实例
+        ProcessInstance procInst = runtimeService.createProcessInstanceQuery()
+                .processInstanceId(findTaskById(taskId).getProcessInstanceId()).singleResult();
+        if (procInst == null) {
+            throw new BusinessException("流程实例未找到!");
+        }
+        return procInst;
+    }
+
+    private HistoricProcessInstance findHisProcInsById(String processId) throws Exception {
+
+        // 找到流程实例
+        HistoricProcessInstance procInst = historyService.createHistoricProcessInstanceQuery().processInstanceId(processId).singleResult();
+        if (procInst == null) {
+            throw new Exception("流程实例未找到!");
+        }
+        return procInst;
+    }
+
+    /**
+     * 根据任务ID获取流程定义
+     *
+     * @param taskId 任务ID
+     * @return
+     * @throws Exception
+     */
+    private ProcessDefinitionEntity findProcDefEntityByTaskId(String taskId) throws BusinessException {
+
+        // 取得流程定义
+        ProcessDefinitionEntity procDef = (ProcessDefinitionEntity) ((RepositoryServiceImpl) repositoryService).getDeployedProcessDefinition(findTaskById(taskId).getProcessDefinitionId());
+
+        if (procDef == null) {
+            throw new BusinessException("流程定义未找到!");
+        }
+
+        return procDef;
+    }
+
+    /**
+     * 根据任务ID和节点ID获取活动节点 <br>
+     *
+     * @param taskId     任务ID
+     * @param activityId 活动节点ID <br>
+     *                   如果为null或""，则默认查询当前活动节点 <br>
+     *                   如果为"end"，则查询结束节点 <br>
+     * @return
+     * @throws Exception
+     */
+    public ActivityImpl findActivitiImpl(String taskId, String activityId) throws BusinessException {
+
+        // 取得流程定义
+        ProcessDefinitionEntity procDef = this.findProcDefEntityByTaskId(taskId);
+
+        // 获取当前活动节点ID
+        if (StringUtil.isStrEmpty(activityId)) {
+            activityId = this.findTaskById(taskId).getTaskDefinitionKey();
+        }
+
+        // 根据流程定义，获取该流程实例的结束节点
+        if (activityId.toUpperCase().equals("END")) {
+            for (ActivityImpl activityImpl : procDef.getActivities()) {
+                List<PvmTransition> pvmTransitionList = activityImpl.getOutgoingTransitions();
+                if (pvmTransitionList.isEmpty()) {
+                    return activityImpl;
+                }
+            }
+        }
+
+        // 根据节点ID，获取对应的活动节点
+        ActivityImpl activityImpl = procDef.findActivity(activityId);
+
+        return activityImpl;
+    }
+
+    @Override
+    public ActivityImpl findPreviousActivitiImpl(String taskId) throws Exception {
+
+        // yujj_2016.09.26 修改获取上一个UserTask的方式，避免返回Gatway。
+        List<ActivityImpl> list = findBackAvtivity(taskId);
+        if (!list.isEmpty()) {
+            return list.get(list.size() - 1);
+        }
+        return null;
+        // // 取得流程定义
+        // ProcessDefinitionEntity procDef =
+        // this.findProcDefEntityByTaskId(taskId);
+        // String activityId = this.findTaskById(taskId).getTaskDefinitionKey();
+        // // 根据节点ID，获取对应的活动节点
+        // ActivityImpl activityImpl01 = ((ProcessDefinitionImpl)
+        // procDef).findActivity(activityId);
+        // for (ActivityImpl activityImpl : procDef.getActivities()) {
+        //
+        // if (activityImpl01.getId().equals(activityImpl.getId())) {
+        // List<PvmTransition> pvmTransitionList =
+        // activityImpl.getIncomingTransitions();
+        // if (!pvmTransitionList.isEmpty()) {
+        // return (ActivityImpl) pvmTransitionList.get(0).getSource();
+        // }
+        // }
+        // }
+        // return null;
+    }
+
+    @Override
+    public String genTaskDiagram(String processInstanceID, String taskId) {
+
+        StringBuffer sbHtml = new StringBuffer();
+
+        InputStream imageStream = null;
+        ByteArrayOutputStream baos = null;
+        try {
+            sbHtml.append("<html>");
+            sbHtml.append("<head>");
+            sbHtml.append("</head>");
+            sbHtml.append("<body>");
+
+            String processDefineID;
+            String processID;
+            if (StringUtils.isNotBlank(processInstanceID)) {
+                HistoricProcessInstance processInstance = findHisProcInsById(processInstanceID);
+                processDefineID = processInstance.getProcessDefinitionId();
+                processID = processInstance.getId();
+            } else if (StringUtils.isNotBlank(taskId)) {
+                ProcessInstance processInstance = findProcInsByTaskId(taskId);
+                processDefineID = processInstance.getProcessDefinitionId();
+                processID = processInstance.getId();
+            } else {
+                throw new BusinessException("必须传入流程实例编码或任务编码。");
+            }
+
+            if (StringUtils.isBlank(processDefineID) || StringUtils.isBlank(processID)) {
+                throw new BusinessException("获取流程信息出错。");
+            }
+
+            BpmnModel bpmnModel = getRepositoryService().getBpmnModel(processDefineID);
+            List<String> activeActivityIds = new ArrayList<String>();
+            String sql = " select * from act_ru_execution t where t.proc_inst_id_ = ?";
+            boolean isExists = checkExists(sql, new Object[]{processID});
+
+            // 根据流程是否已经结束确认是取当前数据还是历史数据
+            if (isExists) {
+                // 流程实例没有结束，从当前表查询
+                activeActivityIds = getRuntimeService().getActiveActivityIds(processID);
+            } else {
+                // 流程实例已经结束，从历史表查询
+                List<HistoricActivityInstance> listHisActivity = getHistoryService()
+                        .createHistoricActivityInstanceQuery().processInstanceId(processID).list();
+                if (listHisActivity.isEmpty()) {
+                    throw new BusinessException("当前流程没有历史活动。");
+                }
+
+                for (int i = 0; i < listHisActivity.size(); i++) {
+                    activeActivityIds.add(listHisActivity.get(i).getActivityId());
+                }
+            }
+            ProcessEngineImpl defaultProcessEngine = (ProcessEngineImpl) ProcessEngines.getDefaultProcessEngine();
+            Context.setProcessEngineConfiguration(defaultProcessEngine.getProcessEngineConfiguration());
+            imageStream = ProcessDiagramGenerator.generateDiagram(bpmnModel, "png", activeActivityIds);
+            baos = new ByteArrayOutputStream();
+            BufferedImage bi = ImageIO.read(imageStream);
+            ImageIO.write(bi, "png", baos);
+            byte[] bytes = baos.toByteArray();
+            String imgStr = Base64.encodeBase64String(bytes).toString();
+
+            sbHtml.append("<img src=\"data:image/png;base64," + imgStr + "\" />");
+
+            sbHtml.append("</body>");
+            sbHtml.append("</html>");
+
+            return new String(sbHtml.toString().getBytes());
+        } catch (Exception ex) {
+            throw new BusinessException(ex);
+        } finally {
+            if (imageStream != null) {
+                try {
+                    imageStream.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+            if (baos != null) {
+                try {
+                    baos.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+
+    }
+
+    public RepositoryService getRepositoryService() {
+
+        return repositoryService;
+    }
+
+    public RuntimeService getRuntimeService() {
+
+        return runtimeService;
+    }
+
+    public TaskService getTaskService() {
+
+        return taskService;
+    }
+
+    public FormService getFormService() {
+
+        return formService;
+    }
+
+    public HistoryService getHistoryService() {
+
+        return historyService;
+    }
+
+    @Override
+    public void setBeanFactory(BeanFactory beanFactory) throws BeansException {
+
+        this.beanFactory = beanFactory;
+    }
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+
+        if (beanFactory instanceof ListableBeanFactory) {
+            ListableBeanFactory listableBeanFactory = (ListableBeanFactory) beanFactory;
+
+            Map<String, OrderBack2SubmitListener> rollbackMap = listableBeanFactory.getBeansOfType(OrderBack2SubmitListener.class);
+            for (Map.Entry<String, OrderBack2SubmitListener> entry : rollbackMap.entrySet()) {
+                rollbackListeners.add(entry.getValue());
+            }
+
+            Map<String, OrderProcessListener> oplistenersMap = listableBeanFactory.getBeansOfType(OrderProcessListener.class);
+            for (Map.Entry<String, OrderProcessListener> entry : oplistenersMap.entrySet()) {
+                orderProcessListeners.add(entry.getValue());
+            }
+
+            Map<String, OrderCompleteListener> completedListenersMap = listableBeanFactory.getBeansOfType(OrderCompleteListener.class);
+            for (Map.Entry<String, OrderCompleteListener> entry : completedListenersMap.entrySet()) {
+                completeListeners.add(entry.getValue());
+            }
+        }
+    }
+
+    /**
+     * @param order
+     * @param avyInstncId
+     * @param avyInstncName 当前节点中文名称
+     * @param type
+     */
+    private void fireOrderProcessEvent(ActivitiOrderVO order, final String taskId, String avyInstncId, String avyInstncName, OrderProcessType type) {
+
+        OrderProcessEvent event = new OrderProcessEvent(order.getPk_order(), taskId, order.getEntity_type(), order.getEntity_id(), type, order);
+        for (OrderProcessListener listener : orderProcessListeners) {
+            if (listener.accept(event)) {
+                listener.processEvent(event);
+            }
+        }
+    }
+
+    private void fireOrderCompletedEvent(OrderCompleteEvent event) {
+
+        for (OrderCompleteListener listener : completeListeners) {
+            if (listener.accept(event)) {
+                listener.processEvent(event);
+            }
+        }
+    }
+
+    private void fireOrderRollbackEvent(OrderBack2SubmitEvent event) {
+
+        for (OrderBack2SubmitListener listener : rollbackListeners) {
+            if (listener.accept(event)) {
+                listener.processEvent(event);
+            }
+        }
+    }
+
+    private String getProcessDefineKeyByBizCode(String entityType) {
+
+        String sql = " select proc_def_key from pub_order_workflow where entity_type = ?";
+
+        return (String) queryForObject(sql, new Object[]{entityType}, String.class);
+    }
+
+    @Override
+    public String findOrderIDByProcessID(String processInstanceID) {
+
+        StringBuffer sbSql = new StringBuffer();
+        sbSql.append(" select pk_order from pub_activiti_order where pcs_instnc_id = ? ");
+
+        return (String) queryForObject(sbSql.toString(), new Object[]{processInstanceID}, String.class);
+    }
+
+    @Override
+    public Object queryEntityByOrderID(String processInstanceID) {
+
+        StringBuffer sbSql = new StringBuffer();
+        sbSql.append(" select entity_id from pub_activiti_order where pcs_instnc_id = ?");
+        return queryForObject(sbSql.toString(), new String[]{processInstanceID}, String.class);
+    }
+
+    public Object queryBizInfoByEntityInfo(String entityId, String entityType) {
+
+        StringBuffer sbSql = new StringBuffer();
+        sbSql.append(" select pk_order, pcs_instnc_id from pub_activiti_order where entity_type = ? and entity_id = ? order by pk_order desc");
+
+        SQLParameter parameter = new SQLParameter();
+        parameter.addParam(entityType);
+        parameter.addParam(entityId);
+
+        List<?> list = queryForList(sbSql.toString(), parameter, new BeanListProcessor(ActivitiOrderVO.class));
+        if (list.isEmpty()) {
+            throw new BusinessException("获取流程信息时出错。");
+        } else {
+            return list.get(0);
+        }
+    }
+
+    @Override
+    public Object queryPcsInstIdByEntityID(String entity_id, String entity_type) {
+        StringBuffer sbSql = new StringBuffer();
+        sbSql.append(" select pcs_instnc_id from pub_activiti_order where entity_id = ? and entity_type = ? and process_status = 3");
+        return queryForObject(sbSql.toString(), new String[]{entity_id, entity_type}, String.class);
+    }
+
+    @Override
+    public void cancelProcess(String entity_id, String entity_type, String reason) throws Exception {
+        if(queryPcsInstIdByEntityID(entity_id, entity_type) != null){
+            String pcsInstncId = queryPcsInstIdByEntityID(entity_id, entity_type).toString();
+            deleteProcessInstance(pcsInstncId, reason);
+            changeProcessStatus(null, 2, pcsInstncId);
+        }else{
+            throw new BusinessException("该单据没有对应的流程实例");
+        }
+    }
+
+    @Override
+    public void deleteProcessInstance(String pcsInstncId, String reason) {
+
+        runtimeService.deleteProcessInstance(pcsInstncId, reason);
+    }
+
+    @Override
+    public TaskDefinition findNextTask(final String taskID) {
+
+        try {
+            Task task = taskService.createTaskQuery().taskId(taskID).singleResult();
+
+            String procInstId = task.getProcessInstanceId();
+
+            // 流程标示
+            String processDefinitionId = historyService.createHistoricProcessInstanceQuery().processInstanceId(procInstId)
+                    .singleResult().getProcessDefinitionId();
+
+
+            ProcessDefinitionEntity processDefine = (ProcessDefinitionEntity) ((RepositoryServiceImpl) repositoryService)
+                    .getDeployedProcessDefinition(processDefinitionId);
+
+            // 执行实例
+            ExecutionEntity execution = (ExecutionEntity) runtimeService.createProcessInstanceQuery()
+                    .processInstanceId(procInstId).singleResult();
+
+            // 当前实例的执行到哪个节点
+            String activitiId = execution.getActivityId();
+
+            // 获得当前任务的所有节点
+            List<ActivityImpl> activitiList = processDefine.getActivities();
+
+            ActivityImpl activityImpl = null;
+
+            for (int i = 0; i < activitiList.size(); i++) {
+
+                String flag = activitiList.get(i).getId();
+                if (flag.equals(activitiId)) {
+
+                    activityImpl = activitiList.get(i);
+                }
+            }
+
+            int num = activitiList.indexOf(activityImpl);
+
+            ActivityImpl activityImpl_ = activitiList.get(num + 1);
+
+            TaskDefinition taskDefinition = ((UserTaskActivityBehavior) activityImpl_.getActivityBehavior())
+                    .getTaskDefinition();
+
+            // 获取下一节点的代办人
+//        System.out.println(taskDefinition.getCandidateGroupIdExpressions().toArray()[0]);
+
+            return taskDefinition;
+        } catch (Exception ex) {
+            logger.error("Error", ex);
+            return null;
+        }
+    }
+
+    @Override
+    public ApproveStatusEnum queryApproveStatus(Map<String, Object> params) {
+
+        String pcs_inst_id = getRecentProcInstId(params);
+        String sql = " select process_status from pub_activiti_order where pcs_instnc_id = ? ";
+        Integer approveStatus = (Integer)queryForObject(sql, new Object[]{pcs_inst_id}, Integer.class);
+
+        return ApproveStatusEnum.getByCode(approveStatus.toString());
+    }
+
+
+
+}
